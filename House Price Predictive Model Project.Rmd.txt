@@ -1,0 +1,572 @@
+---
+title: "House Price Predictive Model Project"
+author: "Khalil Allwood"
+date: "2024-04-27"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#Load the packages
+
+```{r}
+if (!require("pacman")){install.packages("pacman")}
+pacman::p_load(tidyverse,skimr,stringr,missForest,glmnet,magrittr,R.utils,Metrics)
+```
+
+```{r}
+if (!pacman::p_isinstalled(YARF)){
+  pacman::p_install_gh("kapelner/YARF/YARFJARs", ref = "dev")
+  pacman::p_install_gh("kapelner/YARF/YARF", ref = "dev", force = TRUE)
+}
+options(java.parameters = "-Xmx4000m")
+pacman::p_load(YARF)
+
+rm(list = ls())
+```
+
+#Load the data
+
+```{r}
+original_housing_data = read.csv("C:/Users/Khalil/Downloads/housing_data_2016_2017.csv")
+```
+
+#Have a look at the data
+```{r}
+skim(original_housing_data)
+summary(original_housing_data)
+```
+
+#Data Cleaning and Feature Engineering
+
+These features look superfluous...
+```{r}
+housing_data = original_housing_data %>%             dplyr::select(-HITId,-HITTypeId,-Title,-Description,-Keywords,-Reward,-CreationTime,-MaxAssignments,-RequesterAnnotation,-AssignmentDurationInSeconds,-AutoApprovalDelayInSeconds,-Expiration,-NumberOfSimilarHITs,-LifetimeInSeconds,-AssignmentId,-WorkerId,-AssignmentStatus,-AcceptTime,-SubmitTime,-AutoApprovalTime,-ApprovalTime,-RejectionTime,-RequesterFeedback,-WorkTimeInSeconds,-LifetimeApprovalRate,-Last30DaysApprovalRate,-Last7DaysApprovalRate,-URL,-url,-model_type)
+
+skim(housing_data)
+```
+
+
+Let's get all of the zip codes into their respective regions as vectors since this may also be useful.
+
+```{r}
+northeast_queens_zip_codes = c("11361","11362","11363","11364")
+north_queens_zip_codes= c("11354","11355","11356","11357","11358","11359","11360")
+central_queens_zip_codes = c("11365","11366","11367")
+jamaica_zip_codes = c("11412", "11423", "11432", "11433", "11434", "11435", "11436")
+northwest_queens_zip_codes = c("11101", "11102", "11103", "11104", "11105", "11106")
+west_central_queens_zip_codes	= c("11374", "11375", "11379", "11385") 
+southeast_queens_zip_codes = c("11004", "11005", "11411", "11413", "11422", "11426", "11427", "11428", "11429")
+southwest_queens_zip_codes = c("11414", "11415", "11416", "11417", "11418", "11419", "11420", "11421") 
+west_queens_zip_codes = c("11368", "11369", "11370", "11372", "11373", "11377", "11378")
+```
+
+
+Let's get rid of the "$" and commas in the monetary variables
+```{r}
+housing_data$sale_price = gsub("[$,]", "", housing_data$sale_price)
+housing_data$total_taxes = gsub("[$,]", "", housing_data$total_taxes)
+housing_data$common_charges = gsub("[$,]", "", housing_data$common_charges)
+housing_data$maintenance_cost = gsub("[$,]", "", housing_data$maintenance_cost)
+housing_data$parking_charges = gsub("[$,]", "", housing_data$parking_charges)
+housing_data$pct_tax_deductibl = gsub("[$,]", "", housing_data$pct_tax_deductibl)
+housing_data$listing_price_to_nearest_1000 = gsub("[$,]", "", housing_data$listing_price_to_nearest_1000)
+
+```
+
+
+Convert numerical values to the integer class.
+```{r}
+housing_data$num_bedrooms = as.integer(housing_data$num_bedrooms)
+housing_data$num_floors_in_building = as.integer(housing_data$num_floors_in_building)
+housing_data$num_full_bathrooms = as.integer(housing_data$num_full_bathrooms)
+housing_data$num_half_bathrooms = as.integer(housing_data$num_half_bathrooms)
+housing_data$num_total_rooms = as.integer(housing_data$num_total_rooms)
+housing_data$sq_footage =  as.integer(housing_data$sq_footage)
+housing_data$community_district_num =  as.integer(housing_data$community_district_num)
+housing_data$maintenance_cost =  as.integer(housing_data$maintenance_cost)
+housing_data$sale_price =  as.integer(housing_data$sale_price)
+housing_data$pct_tax_deductibl =  as.integer(housing_data$pct_tax_deductibl)
+housing_data$common_charges =  as.integer(housing_data$common_charges)
+housing_data$listing_price_to_nearest_1000 =  as.integer(housing_data$listing_price_to_nearest_1000)
+housing_data$total_taxes =  as.integer(housing_data$total_taxes)
+
+```
+
+
+Let's make some of the categorical features look a bit cleaner while we're at it.
+
+```{r}
+
+#Create binary indicator variables
+housing_data$cats_allowed = ifelse(housing_data$cats_allowed == "yes" ,"yes","no")
+housing_data$dogs_allowed = ifelse(housing_data$dogs_allowed == "yes" ,"yes","no")
+#housing_data$coop_condo = ifelse(housing_data$coop_condo == "co-op",1,0)
+#housing_data$garage_exists = tolower(housing_data$garage_exists)
+#housing_data$garage_exists = ifelse(housing_data$garage_exists %in% c("yes", "underground", "ug"), 1, 0)
+
+#Check if the conditions in the ifelse statements left behind any entries.
+#housing_data %>% distinct(coop_condo)
+housing_data %>% distinct(cats_allowed)
+housing_data %>% distinct(dogs_allowed)
+housing_data$cats_allowed = as.factor(housing_data$cats_allowed) 
+housing_data$dogs_allowed = as.factor(housing_data$dogs_allowed)
+#tail(sort(table(housing_data$dining_room_type)))
+
+#housing_data %>% mutate(listing_price = original_housing_data$listing_price_to_nearest_1000)
+```
+
+Let's get the age of each apartment as its own feature
+
+```{r}
+housing_data = housing_data %>% mutate(age_of_apartment =  2017 - housing_data$approx_year_built)
+```
+
+Having the full addresses aren't really necessary, we just need the zip codes.
+```{r}
+
+#use regex to extract any 5-digit number in the address and store it in a new column
+housing_data = housing_data %>%
+  mutate(zip_codes = str_extract(	
+full_address_or_zip_code, "\\b\\d{5}\\b"))
+
+housing_data$zip_codes = as.factor(housing_data$zip_codes)
+
+#tail(sort(table(housing_data$model_type)))
+```
+
+Some of these addresses didn't have a 5-digit zip code, so the regex split didn't catch them. I may have to search for these manually.
+```{r}
+#problematic indices 
+804
+652
+984
+
+housing_data$zip_code[804] #maybe drop this one?
+housing_data$zip_codes[652] = "11355"
+housing_data$zip_codes[984] = "11369"
+housing_data$zip_codes[324] = "11005"
+housing_data[804,]
+```
+
+Let's investigate the zip codes that say NA, I may be able to fill them in.
+
+```{r}
+missing_zip_codes = which(is.na(housing_data$zip_codes))
+
+
+housing_data[missing_zip_codes,] 
+
+housing_data$zip_codes[111] = "11367"
+housing_data$zip_codes[1002] = "11372"
+housing_data$zip_codes[1019] = "11372"
+housing_data$zip_codes[1124] = "11375"
+housing_data$zip_codes[1285] = "11372"
+housing_data$zip_codes[1292] = "11427"
+housing_data$zip_codes[1571] = "11355"
+#housing_data$zip_codes[1679] = "11372" drop this one
+#housing_data = housing_data[-1679,]
+housing_data$zip_codes[1829] = "11369"
+housing_data$zip_codes[1856] = "11372"
+housing_data$zip_codes[1939] = "11375"
+housing_data$zip_codes[2073] = "11364"
+housing_data$zip_codes[2079] = "11427"
+```
+
+
+Some of the entries had some other 5-digit number in the front. So the regex solution above ended up spuriously identifying them as zip-codes. The solution below is very brute force and probably isn't optimal on with a similar problem of a larger scale. 
+```{r}
+#Find the faulty zip codes
+unique(housing_data$zip_codes)
+
+#group them together
+indicies_with_wrong_zips_1 = which(housing_data$zip_codes == "26910")
+indicies_with_wrong_zips_2 = which(housing_data$zip_codes == "27110")
+indicies_with_wrong_zips_3 = which(housing_data$zip_codes == "27010")
+
+```
+
+Let's deal with the first 5-digit number
+```{r}
+#All of these entries are in Floral Park...
+housing_data[indicies_with_wrong_zips_1,]
+
+#Change the zip code values
+housing_data$zip_codes[indicies_with_wrong_zips_1] = "11005"
+
+```
+
+Now the second one
+```{r}
+#Same as before...
+housing_data[indicies_with_wrong_zips_2,]
+
+#Change the zip code values
+housing_data$zip_codes[indicies_with_wrong_zips_2] = "11005"
+
+```
+
+Now the third one
+```{r}
+#Same as before...
+housing_data[indicies_with_wrong_zips_3,]
+
+#Change the zip code values
+housing_data$zip_codes[indicies_with_wrong_zips_3] = "11005"
+
+```
+
+
+
+
+#Let's make use of the vectors that we made earlier and group the zip codes up by their regions.
+
+```{r}
+
+
+# Calculate the number of zip codes in each region
+# region_lengths = c(length(north_queens_zip_codes), length(northeast_queens_zip_codes), length(northwest_queens_zip_codes), length(west_central_queens_zip_codes), length(west_queens_zip_codes), length(southeast_queens_zip_codes), length(southwest_queens_Zip_codes), length(central_queens_zip_codes), length(jamaica_zip_codes))
+
+# Create a vector specifying the number of times each region name should be repeated
+# each_values = rep(region_lengths, region_lengths)
+
+# Combine vectors into a single data frame
+# zip_codes_lookup_table = data.frame(
+  # , # Combine all region vectors
+  # region_name = rep(c("north_queens", "northeast_queens", "northwest_queens", "west_central_queens","west_queens","southeast_queens","southwest_queens","central_queens","jamaica"), each = each_values)
+# )
+
+# View the lookup table
+# print(zip_codes_lookup_table)
+
+  
+
+#Finally, make the column a factor 
+# housing_data$zip_codes = as.factor(housing_data$zip_codes)
+
+
+```
+
+```{r}
+
+zip_codes_by_region = c(north_queens_zip_codes, northeast_queens_zip_codes, northwest_queens_zip_codes, west_central_queens_zip_codes, west_queens_zip_codes, southeast_queens_zip_codes, southwest_queens_zip_codes, central_queens_zip_codes, jamaica_zip_codes)
+
+region_names = c(rep("north_queens", length(north_queens_zip_codes)),
+                  rep("northeast_queens", length(northeast_queens_zip_codes)),
+                  rep("northwest_queens",length(northwest_queens_zip_codes)),
+                  rep("west_central_queens", length(west_central_queens_zip_codes)),
+                  rep("west_queens", length(west_queens_zip_codes)),
+                  rep("southeast_queens", length(southeast_queens_zip_codes)),
+                  rep("southwest_queens", length(southwest_queens_zip_codes)),
+                  rep("central_queens", length(central_queens_zip_codes)),
+                  rep("jamaica", length(jamaica_zip_codes))
+                  ) 
+
+# Combine vectors into a single data frame
+zip_code_lookup_table = data.frame(
+  zip_codes = zip_codes_by_region,
+  region_name = region_names
+)
+
+# View the lookup table
+print(zip_code_lookup_table)
+
+
+#Left join this with the zip codes column to simplify the feature space
+housing_data= housing_data %>%
+  left_join(zip_code_lookup_table, by = "zip_codes")
+
+#Make it a factor column
+housing_data$region_name = as.factor(housing_data$region_name)
+
+```
+
+Let's double check for anything strange
+```{r}
+missing_regions = which(is.na(housing_data$region_name))
+housing_data[missing_regions,]
+
+housing_data$zip_codes[406] = "11358"
+housing_data$region_name[406] = "north_queens"
+housing_data$zip_codes[697]= "11367"
+housing_data$region_name[697] = "central_queens"
+
+#Drop entries 804 and 1679
+housing_data = housing_data[-804,]
+
+housing_data = housing_data[-1678,]
+
+housing_data[1678,]
+```
+
+Now let's deal with the dining room type feature
+
+```{r}
+unique(as.character(housing_data$dining_room_type)) 
+which(original_housing_data$dining_room_type == "dining area") #There's only two of them.
+
+#Let's just classify the "dining area" ones as "other".
+indices_with_dining_areas = which(housing_data$dining_room_type == "dining area")
+housing_data$dining_room_type[indices_with_dining_areas] = "other"
+housing_data$dining_room_type = as.factor(housing_data$dining_room_type)
+
+
+```
+
+Let's investigate the "kitchen type" feature
+
+```{r}
+unique(housing_data$kitchen_type)
+###########First mistype
+kitchen_indices_1 = which(housing_data$kitchen_type == "Eat in")
+housing_data[kitchen_indices_1,]
+housing_data$kitchen_type[kitchen_indices_1] = "eat in"
+
+#############second mistype
+kitchen_indices_2 = which(housing_data$kitchen_type == "Eat in")
+housing_data[kitchen_indices_2]
+housing_data$kitchen_type[kitchen_indices_2] = "eat in"
+############## third mistype
+
+kitchen_indices_3 = which(housing_data$kitchen_type == "Combo")
+housing_data[kitchen_indices_3,]
+housing_data$kitchen_type[kitchen_indices_3] = tolower(housing_data$kitchen_type[kitchen_indices_3])
+
+######## fourth mistype
+kitchen_indices_4 = which(housing_data$kitchen_type == "eatin")
+housing_data[kitchen_indices_4,]
+housing_data$kitchen_type[kitchen_indices_4] = "eat in"
+
+#### fifth mistype
+kitchen_indices_5 = which(housing_data$kitchen_type == "1955") # maybe impute this one?
+housing_data$kitchen_type[kitchen_indices_5] = NA
+
+############sixth mistype
+kitchen_indices_6 = which(housing_data$kitchen_type == "efficiemcy")
+housing_data[kitchen_indices_6,]
+housing_data$kitchen_type[kitchen_indices_6] = "efficiency"
+
+####### 7th mistype
+kitchen_indices_7 = which(housing_data$kitchen_type == "efficiency kitchene")
+housing_data[kitchen_indices_7,]
+housing_data$kitchen_type[kitchen_indices_7] = "efficiency"
+
+######eight mistype
+kitchen_indices_8 = which(housing_data$kitchen_type == "efficiency ktchen")
+housing_data$kitchen_type[kitchen_indices_8] = "efficiency"
+
+###### ninth mistype
+kitchen_indices_9 = which(housing_data$kitchen_type == "Eat In")
+housing_data$kitchen_type[kitchen_indices_9] = "eat in"
+
+##### tenth mistype
+kitchen_indices_10 = which(housing_data$kitchen_type == "efficiency kitchen")
+housing_data$kitchen_type[kitchen_indices_10] = "efficiency"
+
+housing_data$kitchen_type = as.factor(housing_data$kitchen_type)
+
+```
+
+
+I've decided to just union all of the entries that say underground together with the ones that just say "yes". Then I made them as "1"s to make it an indicator variable.
+```{r}
+unique(housing_data$garage_exists)
+underground_garage_indices = which(housing_data$garage_exists == "Underground")
+housing_data$garage_exists[underground_garage_indices] = "yes"
+
+housing_data$garage_exists[which(housing_data$garage_exists ==  "Yes")] = "yes"
+housing_data$garage_exists[which(housing_data$garage_exists ==  "eys")] = "yes"
+housing_data$garage_exists[which(housing_data$garage_exists ==  "Underground")] = "yes"
+housing_data$garage_exists[which(housing_data$garage_exists ==  "UG")] = "yes"
+housing_data$garage_exists[which(housing_data$garage_exists ==  "yes")] = "yes"
+
+housing_data = housing_data %>%
+  mutate(garage_exists = as.factor(ifelse(is.na(garage_exists), "no", "yes")))
+```
+
+```{r}
+unique(housing_data$fuel_type)
+
+#There's only one 
+housing_data$fuel_type[which(housing_data$fuel_type == "Other")] = "other"
+
+housing_data$fuel_type = as.factor(housing_data$fuel_type)
+
+
+
+```
+
+```{r}
+housing_data$coop_condo = as.factor(housing_data$coop_condo)
+housing_data$garage_exists = as.factor(housing_data$garage_exists)
+housing_data$zip_codes = as.factor(housing_data$zip_codes)
+housing_data$parking_charges = as.integer(housing_data$parking_charges)
+```
+
+Let's make walk score a factor as well for better interpretability
+
+```{r}
+housing_data = housing_data %>%
+  mutate(walkability = case_when(
+    walk_score >= 90 ~ "Walker's Paradise",
+    walk_score >= 70 ~ "Very Walkable",
+    walk_score >= 50 ~ "Somewhat Walkable",
+    walk_score >= 25 ~ "Somewhat Car Dependent",
+    TRUE ~ "Car-Dependent"
+  )) %>% mutate(walkability = factor(walkability, levels = c("Car-Dependent","Somewhat Car-Dependent", "Somewhat Walkable", "Very Walkable", "Walker's Paradise")))
+```
+
+
+
+#Do this after you have completely cleaned the "housing_data" set
+
+```{r}
+housing_data_cleaned = housing_data %>% select(-approx_year_built,-date_of_sale,-full_address_or_zip_code,-zip_codes,-walk_score)
+
+which(is.na(housing_data_cleaned$walkability))
+```
+
+
+Make a table to record missingness in the data and combine it with the design matrix
+```{r}
+M = as_tibble(apply(is.na(housing_data_cleaned), 2, as.numeric))
+colnames(M) = paste("is_missing_", colnames(housing_data_cleaned), sep = "")
+M %<>% 
+  select_if(function(x){sum(x) > 0})
+
+
+M = as_tibble(t(unique(t(M))))
+skim(M)
+
+housing_data_miss = cbind(housing_data_cleaned, M)
+
+housing_data_imp = missForest(data.frame(housing_data_miss))$ximp
+
+
+housing_data_imp = model.matrix(~ 0 + ., housing_data_imp)
+housing_data_imp = as.data.frame(housing_data_imp)
+
+housing_data_imp_with_prices = housing_data_imp %>% filter(is_missing_sale_price == 0)
+housing_data_imp_without_prices = housing_data_imp %>% filter(is_missing_sale_price == 1)
+
+
+set.seed(7)
+n = nrow(housing_data_imp_with_prices)
+k = 5 
+
+test_indices = sample(1 : n, 1 / k * n)
+train_indices = setdiff(1 : n, test_indices)
+
+
+training_data = housing_data_imp_with_prices[train_indices,]
+testing_data = housing_data_imp_with_prices[test_indices,]
+
+x_train = training_data %>% select(-sale_price,-is_missing_sale_price)
+y_train = training_data$sale_price
+x_test = testing_data %>% select(-sale_price,-is_missing_sale_price)
+y_test = testing_data$sale_price
+```
+
+
+#Modeling Creation and Validation
+
+Let's use lasso regression to pick out which features are the strongest.
+
+
+```{r}
+
+x_train_matrix = model.matrix(~ . - 1, data = x_train)
+y_train_vector = as.numeric(y_train)
+
+# Apply lasso regression
+lasso_model = cv.glmnet(x_train_matrix, y_train, alpha = 1) 
+
+best_lambda = lasso_model$lambda.min
+
+lasso_model_best = glmnet(x_train_matrix, y_train, alpha = 1, lambda = best_lambda)
+
+
+# Extract coefficients from the model
+coefficients = coef(lasso_model_best)
+
+# Find the names of the non-zero coefficients
+selected_features = coefficients[, 1] != 0
+selected_feature_names = rownames(coefficients)[selected_features][-1]  # Exclude the intercept
+# Exclude the intercept
+
+
+
+# Subset the training and test data to include only the selected features
+x_train_selected =  x_train %>% select(cats_allowedno, cats_allowedyes,community_district_num,dogs_allowedyes,fuel_typeother,maintenance_cost,num_bedrooms,num_half_bathrooms,total_taxes,listing_price_to_nearest_1000,age_of_apartment,region_namenorth_queens,
+region_namenortheast_queens,region_namenorthwest_queens,region_namesouthwest_queens,`walkabilityWalker's Paradise`,is_missing_dining_room_type,is_missing_pct_tax_deductibl, is_missing_sq_footage,is_missing_walkability)
+
+x_test_selected = x_test %>% select(cats_allowedno, cats_allowedyes,community_district_num,dogs_allowedyes,fuel_typeother,maintenance_cost,num_bedrooms,num_half_bathrooms,total_taxes,listing_price_to_nearest_1000,age_of_apartment,region_namenorth_queens,
+region_namenortheast_queens,region_namenorthwest_queens,region_namesouthwest_queens,`walkabilityWalker's Paradise`,is_missing_dining_room_type,is_missing_pct_tax_deductibl, is_missing_sq_footage,is_missing_walkability)
+
+
+```
+
+Regression Tree Model
+
+```{r}
+
+
+tree_model = YARFCART(as.data.frame(x_train_selected),y_train)
+get_tree_num_nodes_leaves_max_depths(tree_model)
+illustrate_trees(tree_model, max_depth = 4, open_file = TRUE)
+
+
+#In-sample metrics
+y_hat_train_tree = predict(tree_model, x_train_selected)
+e = y_train - y_hat_train_tree
+sd(e) #16947.94
+1 - sd(e) / sd(y_train) #0.9059996
+
+#OOS metrics
+
+y_hat_test_tree = predict(tree_model, x_test_selected)
+e = y_test - y_hat_test_tree
+sd(e) #40850.44
+1 - sd(e) / sd(y_test) #0.7691402
+
+
+
+```
+
+
+OLS Model
+```{r}
+ols_model = lm(y_train ~ ., data = x_train_selected)
+summary(ols_model)
+
+#In-sample metrics
+y_hat_train_ols = predict(ols_model, x_train_selected)
+e = y_train - y_hat_train_ols
+sd(e) #34172.66
+1 - sd(e) / sd(y_train) #0.810464
+
+#OOS metrics
+
+y_hat_test_ols = predict(ols_model, x_test_selected)
+e = y_test - y_hat_test_ols
+sd(e) #36577.18
+1 - sd(e) / sd(y_test) #0.7932899
+
+```
+
+
+
+Random Forest Model
+```{r}
+rf_model = YARF(as.data.frame(x_train_selected),y_train)
+summary(rf_model)
+
+#OOS Metrics
+# R^2: 0.93211 
+#RMSE: 46922.91 
+
+```
+
